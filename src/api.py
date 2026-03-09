@@ -3,7 +3,6 @@ api.py — Route definitions, Ollama-inspired style.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -11,7 +10,7 @@ import time
 from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .engine import EmbedEngine, ModelEngine
@@ -62,6 +61,8 @@ def _embedder(request: Request) -> EmbedEngine:
 
 
 # Helpers
+# TODO build prompt into separate prompt builder class
+# TODO message to prompt to separate chat-template formatter of the tokenizer of the concrete model
 
 def _build_prompt(prompt: str, system: str | None) -> str:
     """Prepend a system instruction to a raw prompt when provided."""
@@ -88,9 +89,9 @@ async def _ndjson_stream(chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
         yield (json.dumps(chunk) + "\n").encode()
 
 
-# /api/status
+# /health
 
-@router.get("/api/status", tags=["ops"])
+@router.get("/health", tags=["server"])
 async def status_endpoint(request: Request) -> StatusResponse:
     inf: ModelEngine = _inference(request)
     emb: EmbedEngine = _embedder(request)
@@ -105,7 +106,7 @@ async def status_endpoint(request: Request) -> StatusResponse:
     )
 
 
-# ── /api/generate ─────────────────────────────────────────────────────────────
+# /api/generate
 
 @router.post("/api/generate", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def generate(req: GenerateRequest, request: Request):
@@ -182,7 +183,7 @@ async def _generate_stream(
         yield (err + "\n").encode()
 
 
-# ── /api/chat ─────────────────────────────────────────────────────────────────
+# /api/chat
 
 @router.post("/api/chat", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def chat(req: ChatRequest, request: Request):
@@ -264,7 +265,7 @@ async def _chat_stream(
         yield (err + "\n").encode()
 
 
-# ── /api/embed ────────────────────────────────────────────────────────────────
+# /api/embed
 
 @router.post("/api/embed", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def embed(req: EmbedRequest, request: Request) -> EmbedResponse:
@@ -290,9 +291,9 @@ async def embed(req: EmbedRequest, request: Request) -> EmbedResponse:
     )
 
 
-# ── /api/model ────────────────────────────────────────────────────────────────
+# /api/model
 
-@router.post("/api/model", tags=["management"], dependencies=[Depends(_verify_key)])
+@router.post("/api/model", tags=["models"], dependencies=[Depends(_verify_key)])
 async def switch_model(req: ModelSwitchRequest, request: Request) -> ModelSwitchResponse:
     """
     Evict the current inference model and set a new default.
@@ -308,3 +309,5 @@ async def switch_model(req: ModelSwitchRequest, request: Request) -> ModelSwitch
         status="scheduled",
         message=f"Model switched to '{req.model}'. It will load on the next inference request.",
     )
+
+# TODO list all models, list currently runm model, health only for current resource usage also not only for models

@@ -14,6 +14,7 @@ dependencies = [
     "sse-starlette>=2.1.0",
     "keras>=3.13.2",
     "torch>=2.10.0",
+    "asyncio>=4.0.0",
 ]
 
 [project.optional-dependencies]

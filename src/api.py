@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .engine import EmbedEngine, ModelEngine
+from src.backend.engine import LazyLoader
 from .model import (
     ChatRequest,
     ChatResponse,
@@ -52,11 +52,11 @@ def _verify_key(
 
 # Engine accessors
 
-def _inference(request: Request) -> ModelEngine:
+def _inference(request: Request) -> LazyLoader:
     return request.app.state.inference_engine
 
 
-def _embedder(request: Request) -> EmbedEngine:
+def _embedder(request: Request) -> LazyLoader:
     return request.app.state.embed_engine
 
 
@@ -93,14 +93,14 @@ async def _ndjson_stream(chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
 
 @router.get("/health", tags=["server"])
 async def status_endpoint(request: Request) -> StatusResponse:
-    inf: ModelEngine = _inference(request)
-    emb: EmbedEngine = _embedder(request)
+    inf: LazyLoader = _inference(request)
+    emb: LazyLoader = _embedder(request)
     return StatusResponse(
         status="ok",
-        inference_model=inf.model_name or inf.default_name,
+        inference_model=inf.model_name,
         inference_loaded=inf.is_loaded,
         inference_idle_seconds=inf.idle_seconds,
-        embed_model=emb.model_name or emb.default_name,
+        embed_model=emb.model_name,
         embed_loaded=emb.is_loaded,
         embed_idle_seconds=emb.idle_seconds,
     )
@@ -110,10 +110,10 @@ async def status_endpoint(request: Request) -> StatusResponse:
 
 @router.post("/api/generate", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def generate(req: GenerateRequest, request: Request):
-    engine: ModelEngine = _inference(request)
+    engine: LazyLoader = _inference(request)
     opts = req.options
     prompt = _build_prompt(req.prompt, req.system)
-    model_name = req.model or engine.default_name
+    model_name = req.model
 
     logger.info("generate model=%s stream=%s", model_name, req.stream)
 
@@ -125,14 +125,14 @@ async def generate(req: GenerateRequest, request: Request):
 
     t0 = time.perf_counter()
     try:
-        text, p_tok, c_tok = await engine.generate(
-            prompt,
-            max_tokens=opts.max_tokens,
-            temperature=opts.temperature,
-            top_p=opts.top_p,
-            stop=opts.stop,
-            model=req.model,
-        )
+        text, p_tok, c_tok = await engine.generate({
+                "prompt": prompt,
+                "max_tokens": opts.max_tokens,
+                "temperature": opts.temperature,
+                "top_p": opts.top_p,
+                "stop": opts.stop,
+                "model": req.model,
+            })
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
@@ -151,20 +151,20 @@ async def generate(req: GenerateRequest, request: Request):
 
 
 async def _generate_stream(
-    engine: ModelEngine,
+    engine: LazyLoader,
     prompt: str,
     model_name: str,
     opts,
 ) -> AsyncIterator[bytes]:
     t0 = time.perf_counter()
     try:
-        async for token in engine.stream(
-            prompt,
-            max_tokens=opts.max_tokens,
-            temperature=opts.temperature,
-            top_p=opts.top_p,
-            stop=opts.stop,
-        ):
+        async for token in await engine.generate_stream({
+            "prompt": prompt,
+            "max_tokens": opts.max_tokens,
+            "temperature": opts.temperature,
+            "top_p": opts.top_p,
+            "stop": opts.stop,
+        }):
             chunk = GenerateResponse(model=model_name, response=token, done=False)
             yield (chunk.model_dump_json() + "\n").encode()
 
@@ -187,10 +187,10 @@ async def _generate_stream(
 
 @router.post("/api/chat", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def chat(req: ChatRequest, request: Request):
-    engine: ModelEngine = _inference(request)
+    engine: LazyLoader = _inference(request)
     opts = req.options
     prompt = _messages_to_prompt(req.messages)
-    model_name = req.model or engine.default_name
+    model_name = req.model
 
     logger.info("chat model=%s stream=%s messages=%d", model_name, req.stream, len(req.messages))
 
@@ -202,14 +202,14 @@ async def chat(req: ChatRequest, request: Request):
 
     t0 = time.perf_counter()
     try:
-        text, p_tok, c_tok = await engine.generate(
-            prompt,
-            max_tokens=opts.max_tokens,
-            temperature=opts.temperature,
-            top_p=opts.top_p,
-            stop=opts.stop,
-            model=req.model,
-        )
+        text, p_tok, c_tok = await engine.generate({
+            "prompt": prompt,
+            "max_tokens": opts.max_tokens,
+            "temperature": opts.temperature,
+            "top_p": opts.top_p,
+            "stop": opts.stop,
+            "model": req.model,
+        })
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
@@ -228,7 +228,7 @@ async def chat(req: ChatRequest, request: Request):
 
 
 async def _chat_stream(
-    engine: ModelEngine,
+    engine: LazyLoader,
     prompt: str,
     model_name: str,
     opts,
@@ -236,13 +236,13 @@ async def _chat_stream(
     t0 = time.perf_counter()
     accumulated = []
     try:
-        async for token in engine.stream(
-            prompt,
-            max_tokens=opts.max_tokens,
-            temperature=opts.temperature,
-            top_p=opts.top_p,
-            stop=opts.stop,
-        ):
+        async for token in await engine.generate_stream({
+            "prompt": prompt,
+            "max_tokens": opts.max_tokens,
+            "temperature": opts.temperature,
+            "top_p": opts.top_p,
+            "stop": opts.stop,
+        }):
             accumulated.append(token)
             chunk = ChatResponse(
                 model=model_name,
@@ -269,15 +269,18 @@ async def _chat_stream(
 
 @router.post("/api/embed", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def embed(req: EmbedRequest, request: Request) -> EmbedResponse:
-    engine: EmbedEngine = _embedder(request)
+    engine: LazyLoader = _embedder(request)
     texts = [req.input] if isinstance(req.input, str) else req.input
-    model_name = req.model or engine.default_name
+    model_name = req.model
 
     logger.info("embed model=%s inputs=%d", model_name, len(texts))
 
     t0 = time.perf_counter()
     try:
-        vectors = await engine.embed(texts, model=req.model)
+        vectors = await engine.generate({
+            "texts": texts,
+            "model": req.model
+        })
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
@@ -299,8 +302,8 @@ async def switch_model(req: ModelSwitchRequest, request: Request) -> ModelSwitch
     Evict the current inference model and set a new default.
     The new model is loaded lazily on the next generate/chat request.
     """
-    engine: ModelEngine = _inference(request)
-    logger.info("model switch requested: %s → %s", engine.default_name, req.model)
+    engine: LazyLoader = _inference(request)
+    logger.info("model switch requested: %s → %s", engine.model_name, req.model)
 
     await engine.switch(req.model)
 
@@ -311,3 +314,4 @@ async def switch_model(req: ModelSwitchRequest, request: Request) -> ModelSwitch
     )
 
 # TODO list all models, list currently runm model, health only for current resource usage also not only for models
+#TODO refactor the api

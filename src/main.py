@@ -14,9 +14,6 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
-import time
-import traceback
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -29,7 +26,7 @@ from fastapi.responses import JSONResponse
 load_dotenv()  # load .env before reading env vars
 
 from .api import router                      # noqa: E402 — must come after load_dotenv
-from .engine import EmbedEngine, ModelEngine  # noqa: E402
+from src.backend.engine import LazyLoader  # noqa: E402
 from .model import ErrorResponse  # noqa: E402
 
 # Logging setup
@@ -85,8 +82,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start engines. Lazy load models and embedders
-    inference_engine = ModelEngine()
-    embed_engine = EmbedEngine()
+    model_registry_backend = os.getenv("MODEL_REGISTRY_BACKEND")
+    inference_engine = LazyLoader(provider=model_registry_backend, label="llm")
+    embed_engine = LazyLoader(provider=model_registry_backend, label="embedder")
+
     app.state.inference_engine = inference_engine
     app.state.embed_engine = embed_engine
 

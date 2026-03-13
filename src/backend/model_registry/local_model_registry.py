@@ -1,0 +1,2 @@
+class LocalProvider(object):
+    pass

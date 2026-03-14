@@ -60,35 +60,6 @@ def _embedder(request: Request) -> LazyLoader:
     return request.app.state.embed_engine
 
 
-# Helpers
-# TODO build prompt into separate prompt builder class
-# TODO message to prompt to separate chat-template formatter of the tokenizer of the concrete model
-
-def _build_prompt(prompt: str, system: str | None) -> str:
-    """Prepend a system instruction to a raw prompt when provided."""
-    if not system:
-        return prompt
-    return f"{system}\n\n{prompt}"
-
-
-def _messages_to_prompt(messages: list[Message]) -> str:
-    """
-    Minimal chat-template formatter for backends that need a single string.
-    Replace with tokenizer.apply_chat_template() for production use.
-    """
-    parts: list[str] = []
-    for m in messages:
-        parts.append(f"<|{m.role}|>\n{m.content}")
-    parts.append("<|assistant|>")
-    return "\n".join(parts)
-
-
-async def _ndjson_stream(chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
-    """Wrap an async token iterator into newline-delimited JSON bytes."""
-    async for chunk in chunks:
-        yield (json.dumps(chunk) + "\n").encode()
-
-
 # /health
 
 @router.get("/health", tags=["server"])
@@ -110,38 +81,44 @@ async def status_endpoint(request: Request) -> StatusResponse:
 
 @router.post("/api/generate", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def generate(req: GenerateRequest, request: Request):
-    engine: LazyLoader = _inference(request)
+    llm_loader: LazyLoader = _inference(request)
     opts = req.options
-    prompt = _build_prompt(req.prompt, req.system)
     model_name = req.model
 
     logger.info("generate model=%s stream=%s", model_name, req.stream)
 
+    input_data = {
+        "prompt": req.prompt,
+        "system_prompt": req.system_prompt or "",
+        "max_tokens": opts.max_tokens,
+        "temperature": opts.temperature,
+        "top_p": opts.top_p,
+        "stop": opts.stop,
+        "model": req.model,
+    }
+
     if req.stream:
         return StreamingResponse(
-            _generate_stream(engine, prompt, model_name, opts),
+            _generate_stream(llm_loader, input_data, model_name),
             media_type="application/x-ndjson",
         )
 
     t0 = time.perf_counter()
     try:
-        text, p_tok, c_tok = await engine.generate({
-                "prompt": prompt,
-                "max_tokens": opts.max_tokens,
-                "temperature": opts.temperature,
-                "top_p": opts.top_p,
-                "stop": opts.stop,
-                "model": req.model,
-            })
+        result: dict = await llm_loader.generate(input_data)
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("generate failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    usage = result.get("usage", {})
+    p_tok = usage.get("prompt_tokens", 0)
+    c_tok = usage.get("completion_tokens", 0)
+
     return GenerateResponse(
         model=model_name,
-        response=text,
+        response=result.get("text"),
         done=True,
         prompt_tokens=p_tok,
         completion_tokens=c_tok,
@@ -152,19 +129,12 @@ async def generate(req: GenerateRequest, request: Request):
 
 async def _generate_stream(
     engine: LazyLoader,
-    prompt: str,
+    input_data: dict,
     model_name: str,
-    opts,
 ) -> AsyncIterator[bytes]:
     t0 = time.perf_counter()
     try:
-        async for token in await engine.generate_stream({
-            "prompt": prompt,
-            "max_tokens": opts.max_tokens,
-            "temperature": opts.temperature,
-            "top_p": opts.top_p,
-            "stop": opts.stop,
-        }):
+        async for token in engine.generate_stream(input_data):
             chunk = GenerateResponse(model=model_name, response=token, done=False)
             yield (chunk.model_dump_json() + "\n").encode()
 
@@ -187,38 +157,42 @@ async def _generate_stream(
 
 @router.post("/api/chat", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def chat(req: ChatRequest, request: Request):
-    engine: LazyLoader = _inference(request)
+    llm_loader: LazyLoader = _inference(request)
     opts = req.options
-    prompt = _messages_to_prompt(req.messages)
     model_name = req.model
+    input_data = {
+        "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+        "max_tokens": opts.max_tokens,
+        "temperature": opts.temperature,
+        "top_p": opts.top_p,
+        "stop": opts.stop,
+        "model": req.model,
+    }
 
     logger.info("chat model=%s stream=%s messages=%d", model_name, req.stream, len(req.messages))
 
     if req.stream:
         return StreamingResponse(
-            _chat_stream(engine, prompt, model_name, opts),
+            _chat_stream(llm_loader, input_data, model_name),
             media_type="application/x-ndjson",
         )
 
     t0 = time.perf_counter()
     try:
-        text, p_tok, c_tok = await engine.generate({
-            "prompt": prompt,
-            "max_tokens": opts.max_tokens,
-            "temperature": opts.temperature,
-            "top_p": opts.top_p,
-            "stop": opts.stop,
-            "model": req.model,
-        })
+        result: dict = await llm_loader.generate(input_data)
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("chat failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    usage = result.get("usage", {})
+    p_tok = usage.get("prompt_tokens", 0)
+    c_tok = usage.get("completion_tokens", 0)
+
     return ChatResponse(
-        model=model_name,
-        message=Message(role="assistant", content=text),
+        model=req.model,
+        message=Message(role="assistant", content=result["text"]),
         done=True,
         prompt_tokens=p_tok,
         completion_tokens=c_tok,
@@ -229,20 +203,13 @@ async def chat(req: ChatRequest, request: Request):
 
 async def _chat_stream(
     engine: LazyLoader,
-    prompt: str,
-    model_name: str,
-    opts,
+    input_data: dict,
+    model_name: str
 ) -> AsyncIterator[bytes]:
     t0 = time.perf_counter()
     accumulated = []
     try:
-        async for token in await engine.generate_stream({
-            "prompt": prompt,
-            "max_tokens": opts.max_tokens,
-            "temperature": opts.temperature,
-            "top_p": opts.top_p,
-            "stop": opts.stop,
-        }):
+        async for token in engine.generate_stream(input_data):
             accumulated.append(token)
             chunk = ChatResponse(
                 model=model_name,
@@ -269,7 +236,7 @@ async def _chat_stream(
 
 @router.post("/api/embed", tags=["inference"], dependencies=[Depends(_verify_key)])
 async def embed(req: EmbedRequest, request: Request) -> EmbedResponse:
-    engine: LazyLoader = _embedder(request)
+    embedder_loader: LazyLoader = _embedder(request)
     texts = [req.input] if isinstance(req.input, str) else req.input
     model_name = req.model
 
@@ -277,8 +244,8 @@ async def embed(req: EmbedRequest, request: Request) -> EmbedResponse:
 
     t0 = time.perf_counter()
     try:
-        vectors = await engine.generate({
-            "texts": texts,
+        result: dict = await embedder_loader.generate({
+            "input": texts,
             "model": req.model
         })
     except NotImplementedError as exc:
@@ -289,28 +256,8 @@ async def embed(req: EmbedRequest, request: Request) -> EmbedResponse:
 
     return EmbedResponse(
         model=model_name,
-        embeddings=vectors,
+        embeddings=result["embeddings"],
         duration_ms=(time.perf_counter() - t0) * 1000,
-    )
-
-
-# /api/model
-
-@router.post("/api/model", tags=["models"], dependencies=[Depends(_verify_key)])
-async def switch_model(req: ModelSwitchRequest, request: Request) -> ModelSwitchResponse:
-    """
-    Evict the current inference model and set a new default.
-    The new model is loaded lazily on the next generate/chat request.
-    """
-    engine: LazyLoader = _inference(request)
-    logger.info("model switch requested: %s → %s", engine.model_name, req.model)
-
-    await engine.switch(req.model)
-
-    return ModelSwitchResponse(
-        model=req.model,
-        status="scheduled",
-        message=f"Model switched to '{req.model}'. It will load on the next inference request.",
     )
 
 # TODO list all models, list currently runm model, health only for current resource usage also not only for models

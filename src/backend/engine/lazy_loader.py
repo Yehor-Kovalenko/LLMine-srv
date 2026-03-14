@@ -92,7 +92,7 @@ class LazyLoader:
         Backend specific cleanup
         :return:
         """
-        self._provider.free(self._model_name)
+        self._engine.free()
         self._engine = None
         self._model_name = None
         self._last_used = 0.0

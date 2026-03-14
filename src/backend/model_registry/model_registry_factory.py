@@ -1,7 +1,7 @@
 from anyio.functools import lru_cache
 
 from .base_model_registry import BaseProvider
-from .hf_model_registry import HuggingFaceProvider
+from .hf_model_registry import HFSafetensorsProvider
 from .local_model_registry import LocalProvider
 from .ollama_model_registry import OllamaProvider
 
@@ -9,11 +9,9 @@ from .ollama_model_registry import OllamaProvider
 def get_llm_provider(kind: str) -> BaseProvider:
 
     if kind == "hf":
-        return HuggingFaceProvider()
+        return HFSafetensorsProvider()
     elif kind == "ollama":
         return OllamaProvider()
-    # elif kind == "vllm":
-    #     return VLLMBackend()
     elif kind == "local":
         return LocalProvider()
     else:

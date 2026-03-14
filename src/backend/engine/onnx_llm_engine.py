@@ -1,54 +1,43 @@
 """
-Safetensors LLM Engine
+ONNX LLM Engine
 
-Loads a causal / seq2seq language model from a safetensors snapshot using
-HuggingFace Transformers and runs text generation on it.
+Runs a causal language model exported to ONNX format via the Optimum library.
+Generation is implemented as a manual token-by-token loop so that streaming
+works without a separate thread.
 """
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator
+from pathlib import Path
+from typing import AsyncGenerator
 
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
-    AutoTokenizer,
-    TextIteratorStreamer,
-    GenerationConfig,
-)
-from threading import Thread
+from transformers import AutoTokenizer
 
-from ._base_engine import BaseEngine
 from src.backend.model_registry_dto import ModelPackage
+from ._base_engine import BaseEngine
 
 logger = logging.getLogger(__name__)
 
 
-def _pick_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-class SafetensorsLLMEngine(BaseEngine):
+class ONNXLLMEngine(BaseEngine):
     """
-    Text generation engine backed by HuggingFace Transformers safetensors weights.
+    Text generation engine backed by an ONNX-exported causal LM.
+
+    Uses ``optimum.onnxruntime.ORTModelForCausalLM`` (or Seq2Seq) which wraps
+    ONNX Runtime with an interface compatible with HuggingFace ``generate()``.
 
     Expected input_data keys:
-        prompt        (str)   – user message / already-formatted prompt
-        system_prompt (str)   – optional system message
-        temperature   (float) – sampling temperature, default 0.7
-        max_new_tokens (int)  – default 512
-        top_p         (float) – nucleus sampling, default 0.9
-        top_k         (int)   – default 50
+        prompt         (str)   – user message
+        system_prompt  (str)   – optional system prefix
+        temperature    (float) – default 0.7
+        max_new_tokens (int)   – default 512
+        top_p          (float) – default 0.9
+        top_k          (int)   – default 50
         repetition_penalty (float) – default 1.0
     """
 
-    def __init__(self, model_package: ModelPackage, device: str | None = None):
-        self._device = device or _pick_device()
+    def __init__(self, model_package: ModelPackage, use_gpu: bool = False):
+        self._use_gpu = use_gpu
         self.tokenizer = None
         super().__init__(model_package)
 
@@ -57,32 +46,41 @@ class SafetensorsLLMEngine(BaseEngine):
     # ------------------------------------------------------------------
 
     def load_logic(self):
-        path = self.package.path
-        logger.info("Loading safetensors LLM from '%s' on device '%s'", path, self._device)
+        model_path = Path(self.package.path)
+        # Optimum expects the directory that contains the .onnx file
+        model_dir = model_path if model_path.is_dir() else model_path.parent
 
-        self.tokenizer = AutoTokenizer.from_pretrained(path)
+        logger.info("Loading ONNX LLM from '%s' (gpu=%s)", model_dir, self._use_gpu)
+
+        provider = "CUDAExecutionProvider" if self._use_gpu else "CPUExecutionProvider"
+
+        # Import here so the rest of the codebase doesn't hard-depend on optimum
+        try:
+            from optimum.onnxruntime import ORTModelForCausalLM, ORTModelForSeq2SeqLM
+        except ImportError as exc:
+            raise ImportError(
+                "optimum[onnxruntime] is required for the ONNX LLM engine. "
+                "Install it with: pip install 'optimum[onnxruntime]'"
+            ) from exc
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Try causal first, fall back to seq2seq
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                path,
-                torch_dtype=torch.float16 if self._device != "cpu" else torch.float32,
-                device_map=self._device,
-                low_cpu_mem_usage=True,
+            model = ORTModelForCausalLM.from_pretrained(
+                model_dir,
+                provider=provider,
+                use_io_binding=self._use_gpu,
             )
-        except (ValueError, OSError):
-            logger.debug("CausalLM load failed, trying Seq2SeqLM")
-            model = AutoModelForSeq2SeqLM.from_pretrained(
-                path,
-                torch_dtype=torch.float16 if self._device != "cpu" else torch.float32,
-                device_map=self._device,
-                low_cpu_mem_usage=True,
+        except Exception:
+            logger.debug("ORTModelForCausalLM failed, trying ORTModelForSeq2SeqLM")
+            model = ORTModelForSeq2SeqLM.from_pretrained(
+                model_dir,
+                provider=provider,
             )
 
-        model.eval()
-        logger.info("Safetensors LLM loaded  (%s parameters)", f"{sum(p.numel() for p in model.parameters()):,}")
+        logger.info("ONNX LLM loaded from '%s'", model_dir)
         return model
 
     async def generate(self, input_data: dict) -> dict:
@@ -100,6 +98,16 @@ class SafetensorsLLMEngine(BaseEngine):
         return {"text": text.strip(), "model_id": self.package.id}
 
     async def generate_stream(self, input_data: dict) -> AsyncGenerator[str, None]:
+        """
+        Token-by-token greedy/sampling loop that yields each decoded token as
+        a string chunk, giving a streaming feel without a background thread.
+
+        Note: this is a simplified loop – for full beam search / sampling parity
+        with ``generate()``, use the non-streaming path.
+        """
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+
         input_ids = self._build_input_ids(input_data)
         gen_kwargs = self._build_gen_kwargs(input_data, input_ids)
 
@@ -113,18 +121,17 @@ class SafetensorsLLMEngine(BaseEngine):
         thread = Thread(target=self.model.generate, kwargs=gen_kwargs, daemon=True)
         thread.start()
 
-        loop = asyncio.get_event_loop()
         for chunk in streamer:
             yield chunk
-            await asyncio.sleep(0)   # yield control back to the event loop
+            await asyncio.sleep(0)
 
         thread.join()
 
     async def free(self) -> None:
-        logger.info("Freeing safetensors LLM '%s'", self.package.id)
+        logger.info("Freeing ONNX LLM session for '%s'", self.package.id)
+        # ORTModel holds an InferenceSession; releasing the Python object
+        # is sufficient for ONNX Runtime to free its native resources.
         del self.model
-        if self._device == "cuda":
-            torch.cuda.empty_cache()
         self.model = None
 
     # ------------------------------------------------------------------
@@ -135,7 +142,6 @@ class SafetensorsLLMEngine(BaseEngine):
         system_prompt: str = input_data.get("system_prompt", "")
         prompt: str = input_data.get("prompt", "")
 
-        # Use chat template if the tokenizer supports it, otherwise concatenate
         if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
             messages = []
             if system_prompt:
@@ -147,7 +153,7 @@ class SafetensorsLLMEngine(BaseEngine):
         else:
             full_prompt = f"{system_prompt}\n\n{prompt}".strip() if system_prompt else prompt
 
-        return self.tokenizer(full_prompt, return_tensors="pt").input_ids.to(self._device)
+        return self.tokenizer(full_prompt, return_tensors="pt").input_ids
 
     def _build_gen_kwargs(self, input_data: dict, input_ids) -> dict:
         return dict(

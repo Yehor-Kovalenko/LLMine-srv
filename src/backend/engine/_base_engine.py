@@ -20,3 +20,6 @@ class BaseEngine(ABC):
     @abstractmethod
     async def generate_stream(self, input_data: dict) -> Any:
         ...
+    @abstractmethod
+    async def free(self):
+        ...

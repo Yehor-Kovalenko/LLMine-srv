@@ -32,7 +32,7 @@ class GenerateRequest(BaseModel):
     """
     model: str | None = None          # overrides the server's active model
     prompt: str
-    system: str | None = None         # prepended as a system instruction
+    system_prompt: str | None = None         # prepended as a system instruction
     stream: bool = False
     options: GenerateOptions = Field(default_factory=GenerateOptions)
 
@@ -95,19 +95,6 @@ class EmbedResponse(BaseModel):
     model: str
     embeddings: list[list[float]]     # one vector per input string
     duration_ms: float | None = None
-
-
-
-# /api/model  (switch active model)
-
-class ModelSwitchRequest(BaseModel):
-    model: str
-
-
-class ModelSwitchResponse(BaseModel):
-    model: str
-    status: Literal["loaded", "scheduled"]
-    message: str
 
 
 # /api/status

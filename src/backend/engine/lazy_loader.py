@@ -6,6 +6,8 @@ import os
 import time
 from typing import Any
 
+from fastapi import HTTPException
+
 from ._base_engine import BaseEngine
 from src.backend.model_registry import get_llm_provider
 from .engine_factory import EngineFactory
@@ -99,7 +101,10 @@ class LazyLoader:
 
     # Public API ########################
     async def generate(self, input_data: dict):
-        engine = await self.get(self._model_name)
+        if input_data.get("model") is None:
+            raise HTTPException(status_code=400, detail="No model provided.")
+
+        engine = await self.get(input_data.get("model"))
         return await engine.generate(input_data)
 
     async def generate_stream(self, input_data: dict):

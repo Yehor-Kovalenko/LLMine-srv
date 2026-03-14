@@ -23,8 +23,6 @@ from .model import (
     GenerateRequest,
     GenerateResponse,
     Message,
-    ModelSwitchRequest,
-    ModelSwitchResponse,
     StatusResponse,
 )
 

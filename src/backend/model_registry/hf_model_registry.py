@@ -8,7 +8,7 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-from base_model_registry import BaseProvider
+from .base_model_registry import BaseProvider
 from src.backend.model_registry_dto import ModelFormat, ModelPackage
 
 logger = logging.getLogger(__name__)

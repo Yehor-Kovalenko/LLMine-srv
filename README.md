@@ -1,16 +1,66 @@
 # LLMine-srv
-
-Local fully configurable LLM inference server built with **FastAPI**.
+A lightweight, self-hosted inference server for running AI models locally. 
 For loading all models you want!
+---
 
-## Stack
+## What it does
 
-|Layer| Tech                                   |
-|---|----------------------------------------|
-|API framework| FastAPI + uvicorn                      |
-|Streaming| sse-starlette (SSE)                    |
-|Dependency manager| uv                                     |
-|Inference backend| HuggingFace Transformers (safetensors) |
+PROJECT lets you load and serve AI models from your own machine. Point it at a HuggingFace repo, an Ollama registry, or a local folder — and it handles the rest. Switch models on the fly, stream tokens as they're generated, and embed text without sending a single byte to an external API.
+
+---
+
+## Features
+
+- **Multiple model formats** — Safetensors, GGUF, and ONNX all work as first-class citizens
+- **Multiple registries** — pull from HuggingFace Hub, Ollama, or a local directory via `LOCAL_REGISTRY_DIR`
+- **Streaming** — token-by-token streaming on all LLM endpoints via NDJSON
+- **Lazy loading & auto-eviction** — models load on first request and are evicted from memory when idle, keeping resource usage lean
+- **Windows-friendly** — GGUF inference runs via `ctransformers` (pre-built wheels, no C++ compiler needed)
+- **Ollama-inspired API** — familiar endpoint structure if you've used Ollama before; easy to swap in
+
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Server and model status |
+| `POST` | `/api/generate` | Single-turn text generation |
+| `POST` | `/api/chat` | Multi-turn chat with message history |
+| `POST` | `/api/embed` | Text embeddings |
+| `POST` | `/api/model` | Hot-swap the active model |
+
+All write endpoints accept `"stream": true` for streaming responses.
+
+Optional bearer token auth — set `API_KEY` env var to enable, leave it empty to skip.
+
+---
+
+## Supported backends
+
+| Format | LLM | Embedder | Library |
+|--------|-----|----------|---------|
+| Safetensors | ✅ | ✅ | `transformers` + `torch` |
+| GGUF | ✅ | ✅ | `ctransformers` / `sentence-transformers` |
+| ONNX | ✅ | ✅ | `optimum` + `onnxruntime` |
+| Ollama | ✅ | ✅ | Ollama daemon (HTTP) |
+
+
+---
+
+## Configuration
+
+Example .env file was provided in the project, copy it in the root directory:
+```cmd
+cp ./example.env ./.env
+```
+Then modify variables as you wish, main ones described here:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `API_KEY` | *(empty)* | Bearer token for auth. Auth is disabled when empty. |
+| `LOCAL_REGISTRY_DIR` | *(none)* | Root directory for the local model registry |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama daemon address |
 
 ---
 
@@ -18,7 +68,7 @@ For loading all models you want!
 
 ### 1. Configure
 
-Create `.env` file with variables as in `example.env`
+Should have `.env` file with variables as in `example.env`
 
 ### 2. Run locally
 
@@ -42,38 +92,3 @@ Logs are written to `./logs/server.log` with automatic rotation:
 - Format: `TIMESTAMP | LEVEL | logger | message`
 
 ---
-
-## Project structure
-
-```
-my-llm-server/
-├── .env                    # Secrets (API_KEY, MODEL_PATH, …)
-├── pyproject.toml          # uv project definition
-├── uv.lock                 # Deterministic lock file
-├── logs/                   # Created at runtime
-└── src/
-    ├── __init__.py
-    |-- engine
-         |-- __init__.py
-         |- _base.py        # Base engine for lazy loading models
-         |- embed_engine.py # for loading embedders
-         |_ model_engine.py # engine for loading models
-    ├── main.py             # App factory, middleware, logging, lifespan
-    ├── api.py              # Route handlers
-    ├── engine.py           # Lazy-load + TTL eviction
-    └── model.py            # Pydantic request/response schemas
-```
-##### Features:
-- Memory efficient lazy model loading that also handles model's eviction and freeing the machine's resources
-- Live streaming response along side with standard response
-
-[//]: # (- Api endpoint for choosing the adapter type &#40;finetuned&#41;)
-[//]: # (- Endpoint for loading different models)
-[//]: # (- Rate limiting using nginx)
-[//]: # (- Api key using nginx)
-[//]: # (- ngrok for remote tunnel sharing)
-[//]: # (-  **The Fix for prompt injection:** Use **Chat Templates**. Don't manually build strings; use the tokenizer's `apply_chat_template` method to ensure the model can distinguish between "System" instructions and "User" input.)
-- Loads only models in safetensors format to prevent from remote code execution attacks
-
-[//]: # (- nd set a `max_model_len` or `max_tokens` limit in your inference engine &#40;vLLM or Hugging Face&#41; to prevent massive prompts from crashing the hardware.)
-- Extensive configurable logging

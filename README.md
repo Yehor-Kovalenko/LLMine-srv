@@ -5,7 +5,7 @@ For loading all models you want!
 
 ## What it does
 
-PROJECT lets you load and serve AI models from your own machine. Point it at a HuggingFace repo, an Ollama registry, or a local folder — and it handles the rest. Switch models on the fly, stream tokens as they're generated, and embed text without sending a single byte to an external API.
+LLMine-srv lets you load and serve AI models from your own machine. Point it at a HuggingFace repo, an Ollama registry, or a local folder — and it handles the rest. Switch models on the fly, stream tokens as they're generated, and embed text without sending a single byte to an external API.
 
 ---
 
